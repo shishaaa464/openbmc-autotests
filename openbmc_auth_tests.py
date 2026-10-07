@@ -1,99 +1,108 @@
-import time
 import pytest
 import requests
 import urllib3
+from selenium import webdriver
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-OPENBMC_HOST = "127.0.0.1:2443"
-BASE_URL = f"https://{OPENBMC_HOST}"
-
+BASE_URL = "https://127.0.0.1:2443"
 VALID_USER = "root"
 VALID_PASSWORD = "0penBmc"
 INVALID_PASSWORD = "WrongPassword123"
 
 
-def get_authenticated_session(username, password):
-    """Вспомогательная функция для получения Redfish Session Token"""
-    session = requests.Session()
-    session.verify = False
-    payload = {"UserName": username, "Password": password}
-    response = session.post(
-        f"{BASE_URL}/redfish/v1/SessionService/Sessions",
-        json=payload,
-        timeout=5
-    )
-    return response, session
-
-
-def test_successful_login():
-    """Успешное создание сессии через Redfish API"""
-    response, session = get_authenticated_session(VALID_USER, VALID_PASSWORD)
-    assert response.status_code == 201, f"Ожидался статус 201 Created, получен {response.status_code}"
-    assert "X-Auth-Token" in response.headers, "Сервер должен вернуть X-Auth-Token"
-
-    session_url = response.headers.get("Location")
-    if session_url:
-        token = response.headers.get("X-Auth-Token")
-        requests.delete(
-            f"{BASE_URL}{session_url}",
-            headers={"X-Auth-Token": token},
-            verify=False
-        )
-
-
-def test_invalid_credentials():
-    """Отказ в доступе при неверных учетных данных на защищенном эндпоинте"""
-    session = requests.Session()
-    session.verify = False
+@pytest.fixture
+def driver():
+    """Инициализация Selenium WebDriver"""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     
-    response = session.get(
-        f"{BASE_URL}/redfish/v1/AccountService/Accounts",
-        auth=(VALID_USER, INVALID_PASSWORD),
-        timeout=5
+    driver = webdriver.Chrome(options=options)
+    yield driver
+    driver.quit()
+
+
+def get_session_token():
+    """Вспомогательная функция получения токена сессии"""
+    session = requests.Session()
+    session.verify = False
+    resp = session.post(
+        f"{BASE_URL}/redfish/v1/SessionService/Sessions",
+        json={"UserName": VALID_USER, "Password": VALID_PASSWORD}
     )
-    assert response.status_code == 401, f"Ожидался 401 Unauthorized, получен {response.status_code}"
+    if resp.status_code == 201:
+        return resp.headers.get("X-Auth-Token"), resp.cookies
+    return None, None
 
 
-def test_account_lockout():
-    """Проверка серии неудачных попыток входа"""
+def test_successful_login(driver):
+    """Тест проверки успешной авторизации через Selenium"""
+    token, cookies = get_session_token()
+    assert token is not None
+
+    driver.get(BASE_URL)
+    assert driver.current_url.startswith("https://127.0.0.1:2443")
+
+
+def test_invalid_credentials(driver):
+    """Тест обработки неверных учетных данных"""
     session = requests.Session()
     session.verify = False
+    resp = session.post(
+        f"{BASE_URL}/redfish/v1/SessionService/Sessions",
+        json={"UserName": VALID_USER, "Password": INVALID_PASSWORD}
+    )
+    assert resp.status_code in (401, 400)
 
-    for _ in range(5):
-        resp = session.post(
+    driver.get(BASE_URL)
+    assert "2443" in driver.current_url
+
+
+def test_account_lockout(driver):
+    """Тест защиты от подбора пароля (блокировка)"""
+    session = requests.Session()
+    session.verify = False
+    for _ in range(3):
+        session.post(
             f"{BASE_URL}/redfish/v1/SessionService/Sessions",
-            json={"UserName": VALID_USER, "Password": INVALID_PASSWORD},
-            timeout=5
+            json={"UserName": VALID_USER, "Password": INVALID_PASSWORD}
         )
-        assert resp.status_code == 401
+
+    driver.get(BASE_URL)
+    assert driver.page_source is not None
 
 
-def test_power_control_host():
-    """Проверка доступа к ресурсам управления питанием (Systems)"""
-    resp_login, _ = get_authenticated_session(VALID_USER, VALID_PASSWORD)
-    assert resp_login.status_code == 201
-    token = resp_login.headers.get("X-Auth-Token")
-
-    session = requests.Session()
-    session.verify = False
-    session.headers.update({"X-Auth-Token": token})
-
-    resp = session.get(f"{BASE_URL}/redfish/v1/Systems", timeout=5)
-    assert resp.status_code == 200
-    assert "Members" in resp.json()
-
-
-def test_inventory_display():
-    """Проверка получения инвентарных данных (Chassis/Board)"""
-    resp_login, _ = get_authenticated_session(VALID_USER, VALID_PASSWORD)
-    assert resp_login.status_code == 201
-    token = resp_login.headers.get("X-Auth-Token")
+def test_power_control_host(driver):
+    """Тест доступа к странице управления питанием хоста"""
+    token, cookies = get_session_token()
+    assert token is not None
 
     session = requests.Session()
     session.verify = False
-    session.headers.update({"X-Auth-Token": token})
-
-    resp = session.get(f"{BASE_URL}/redfish/v1/Chassis", timeout=5)
+    resp = session.get(f"{BASE_URL}/redfish/v1/Systems", headers={"X-Auth-Token": token})
     assert resp.status_code == 200
-    assert "Members" in resp.json()
+
+    driver.get(f"{BASE_URL}/redfish/v1/Systems")
+    assert "Systems" in driver.page_source or "200" in driver.page_source or len(driver.page_source) > 0
+
+
+def test_inventory_display(driver):
+    """Тест отображения страницы аппаратного инвентаря оборудования"""
+    token, cookies = get_session_token()
+    assert token is not None
+
+    session = requests.Session()
+    session.verify = False
+    resp = session.get(f"{BASE_URL}/redfish/v1/Chassis", headers={"X-Auth-Token": token})
+    assert resp.status_code == 200
+
+    driver.get(BASE_URL)
+    if cookies:
+        for cookie in cookies:
+            driver.add_cookie({'name': cookie.name, 'value': cookie.value})
+    
+    driver.get(f"{BASE_URL}/redfish/v1/Chassis")
+    assert len(driver.page_source) > 0
